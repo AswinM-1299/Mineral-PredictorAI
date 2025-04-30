@@ -1,0 +1,609 @@
+# =====$CODE BY ASWIN MOHAN$=====
+# ===============================
+# 1. Install Libraries
+# ===============================
+!pip install geopandas rasterio scikit-learn torch torchvision shapely matplotlib folium branca imbalanced-learn plotly
+
+import os
+import zipfile
+import pandas as pd
+import geopandas as gpd
+import rasterio
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import plotly.express as px
+import folium
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve, auc, classification_report
+from imblearn.over_sampling import BorderlineSMOTE
+from shapely.geometry import Point
+from google.colab import files
+import branca
+import warnings
+warnings.filterwarnings('ignore')
+
+# 2. Upload and Extract Zipped Datasets
+
+print("Upload all ZIP files (geomorphology, exploration, gravity, magnetic, geology, stream sediments)")
+
+uploaded = files.upload()
+
+for fname in uploaded.keys():
+    if fname.endswith('.zip'):
+        with zipfile.ZipFile(fname, 'r') as zip_ref:
+            zip_ref.extractall("/content/data")
+            print(f"Extracted {fname}")
+
+DATA_DIR = "/content/data"
+ 
+# 3. Load Shapefiles and Rasters
+ 
+
+# Accept both .tif and .tiff
+shapefiles = [os.path.join(root, file) for root, dirs, files in os.walk(DATA_DIR) for file in files if file.endswith(".shp")]
+rasterfiles = [os.path.join(root, file) for root, dirs, files in os.walk(DATA_DIR) for file in files if file.lower().endswith(('.tif', '.tiff'))]
+csvfiles = [os.path.join(root, file) for root, dirs, files in os.walk(DATA_DIR) for file in files if file.endswith(".csv")]
+
+print("All available raster files:")
+for r in rasterfiles:
+    print(r)
+
+# Assign important datasets
+geo_chem_csv = [c for c in csvfiles if "stream" in c.lower()][0]
+gravity_csv = [c for c in csvfiles if "gravity" in c.lower()][0]
+
+# Aeromagnetic raster
+aero_candidates = [r for r in rasterfiles if "TAIL_TMI_GE" in r.lower()]
+if aero_candidates:
+    aeromag_raster = aero_candidates[0]
+else:
+    raise FileNotFoundError("No aeromagnetic raster found!")
+
+# Ground gravity raster
+grav_candidates = [r for r in rasterfiles if "grav" in r.lower()]
+if grav_candidates:
+    ground_gravity_raster = grav_candidates[0]
+else:
+    raise FileNotFoundError("No ground gravity raster found!")
+
+# Load main shapefiles
+faults = gpd.read_file([s for s in shapefiles if "fault" in s.lower()][0])
+folds = gpd.read_file([s for s in shapefiles if "fold" in s.lower()][0])
+oriented_structures = gpd.read_file([s for s in shapefiles if "oriented_structure_plane" in s.lower()][0])
+exploration = gpd.read_file([s for s in shapefiles if "exploration" in s.lower()][0])
+geomorphology = gpd.read_file([s for s in shapefiles if "geomorphology" in s.lower()][0])
+geochronology = gpd.read_file([s for s in shapefiles if "geochronology" in s.lower()][0])
+
+print("Loaded all necessary shapefiles.")
+ 
+# 4. Sample Rasters and Calculate Distances
+# Load geochemical data
+geo_chem_df = pd.read_csv(geo_chem_csv)
+
+# Open raster datasets
+aero_data = rasterio.open(aeromag_raster)
+grav_data = rasterio.open(ground_gravity_raster)
+
+# 4.1 CRS Corrections
+# 1. Confirm geo_chem uses correct CRS (EPSG:4326, WGS84)
+geo_chem = gpd.GeoDataFrame(
+    geo_chem_df,
+    geometry=gpd.points_from_xy(geo_chem_df['X'], geo_chem_df['Y']),
+    crs='EPSG:4326'  # Correct for lat/lon
+)
+
+# Preserve WGS84 version for mapping
+geo_chem_wgs84 = geo_chem.to_crs(epsg=4326)
+# Use raster CRS for sampling
+geo_chem_proj = geo_chem.to_crs(aero_data.crs)
+# Function to sample raster values
+def sample_raster(raster, points_gdf):
+    band1 = raster.read(1)
+    values = []
+    for pt in points_gdf.geometry:
+        try:
+            row, col = raster.index(pt.x, pt.y)
+            values.append(band1[row, col])
+        except:
+            values.append(np.nan)
+    return values
+
+# Sample magnetic and gravity values
+geo_chem['magnetic_value'] = sample_raster(aero_data, geo_chem_proj)
+geo_chem['gravity_value'] = sample_raster(grav_data, geo_chem_proj)
+
+# Calculate distances
+geo_chem['dist_to_fault'] = geo_chem.geometry.apply(lambda point: faults.distance(point).min())
+geo_chem['dist_to_fold'] = geo_chem.geometry.apply(lambda point: folds.distance(point).min())
+geo_chem['dist_to_oriented_structure'] = geo_chem.geometry.apply(lambda point: oriented_structures.distance(point).min())
+geo_chem['dist_to_exploration'] = geo_chem.geometry.apply(lambda point: exploration.distance(point).min())
+geo_chem['dist_to_geomorphology'] = geo_chem.geometry.apply(lambda point: geomorphology.distance(point).min())
+geo_chem['dist_to_geochronology'] = geo_chem.geometry.apply(lambda point: geochronology.distance(point).min())
+
+# Drop any missing raster samples
+geo_chem = geo_chem.dropna(subset=['magnetic_value', 'gravity_value'])
+
+print("Raster sampling and distance calculation complete.")
+ 
+# 5. Generate Synthetic Depth
+ 
+
+# Normalize magnetic values
+mag_norm = (geo_chem['magnetic_value'] - geo_chem['magnetic_value'].min()) / (geo_chem['magnetic_value'].max() - geo_chem['magnetic_value'].min())
+
+# Depth (0m = surface, 1000m = deeper)
+geo_chem['synthetic_depth'] = (1 - mag_norm) * 1000
+
+print("Synthetic depth model (0–1000m) generated.")
+ 
+# 6. Feature Engineering (Expanded Minerals)
+ 
+# Features to use
+feature_columns = [
+    'magnetic_value',
+    'gravity_value',
+    'dist_to_fault',
+    'dist_to_fold',
+    'dist_to_oriented_structure',
+    'dist_to_exploration',
+    'dist_to_geomorphology',
+    'dist_to_geochronology',
+    'synthetic_depth'
+]
+
+# Add geochemical features used for mineral prediction
+geochem_features = [
+    'Ce_ppm', 'La_ppm', 'Nd_ppm', 'Cu_ppm', 'Au_ppb',
+    'U_ppm', 'Th_ppm', 'Pb_ppm', 'Zn_ppm',
+    'Ni_ppm', 'Co_ppm', 'Li_ppm', 'Cr_ppm'
+]
+
+feature_columns.extend(geochem_features)
+
+# Filter columns
+X = geo_chem[feature_columns].fillna(0)
+
+# Expanded assign_mineral() function
+def assign_mineral(row):
+    if row['Ce_ppm'] > 100:
+        return 0  # Ce
+    elif row['La_ppm'] > 50:
+        return 1  # La
+    elif row['Nd_ppm'] > 50:
+        return 2  # Nd
+    elif row['Cu_ppm'] > 200:
+        return 3  # Cu
+    elif row['Au_ppb'] > 100:
+        return 4  # Au
+    elif row['U_ppm'] > 10:
+        return 5  # U
+    elif row['Th_ppm'] > 10:
+        return 6  # Th
+    elif row['Pb_ppm'] > 100:
+        return 7  # Pb
+    elif row['Zn_ppm'] > 300:
+        return 8  # Zn
+    elif row['Ni_ppm'] > 100:
+        return 9  # Ni
+    elif row['Co_ppm'] > 30:
+        return 10 # Co
+    elif row['Li_ppm'] > 50:
+        return 11 # Li
+    elif row['Cr_ppm'] > 200:
+        return 12 # Cr
+    else:
+        return -1  # No significant deposit
+
+geo_chem['mineral_label'] = geo_chem.apply(assign_mineral, axis=1)
+
+# Remove no deposit samples
+geo_chem = geo_chem[geo_chem['mineral_label'] >= 0]
+
+# Final features and labels
+X = geo_chem[feature_columns].fillna(0)
+y = geo_chem['mineral_label']
+
+# Normalize features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+print("Expanded feature matrix and labels prepared (13 minerals).")
+ 
+# 7. BorderlineSMOTE and Train-Test Split
+ 
+
+from imblearn.over_sampling import BorderlineSMOTE
+
+# Apply Borderline SMOTE
+smote = BorderlineSMOTE(k_neighbors=2,random_state=42)
+X_resampled, y_resampled = smote.fit_resample(X_scaled, y)
+
+# Train-Test split
+X_train, X_val, y_train, y_val = train_test_split(X_resampled, y_resampled, test_size=0.2, random_state=42)
+
+print(f"Training samples: {len(X_train)}, Validation samples: {len(X_val)}")
+ 
+# 8. Train Random Forest and MLP Models
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
+
+# Random Forest
+rf_model = RandomForestClassifier(n_estimators=300, max_depth=20, random_state=42)
+rf_model.fit(X_train, y_train)
+rf_preds = rf_model.predict(X_val)
+rf_probs = rf_model.predict_proba(X_val)
+
+# MLP
+mlp_model = MLPClassifier(hidden_layer_sizes=(128, 64), activation='relu', solver='adam', max_iter=300, random_state=42)
+mlp_model.fit(X_train, y_train)
+mlp_preds = mlp_model.predict(X_val)
+mlp_probs = mlp_model.predict_proba(X_val)
+
+print("Both RandomForest and MLP models trained.")
+ 
+# 9. Pick Best Model Based on Validation ROC-AUC
+ 
+def calculate_macro_auc(y_true, probs):
+    aucs = []
+    for i in range(probs.shape[1]):
+        try:
+            aucs.append(roc_auc_score((y_true == i).astype(int), probs[:, i]))
+        except:
+            aucs.append(0)
+    return np.mean(aucs)
+
+rf_auc = calculate_macro_auc(y_val, rf_probs)
+mlp_auc = calculate_macro_auc(y_val, mlp_probs)
+
+print(f"Random Forest Validation ROC-AUC: {rf_auc:.4f}")
+print(f"MLP Validation ROC-AUC: {mlp_auc:.4f}")
+
+# Pick best model
+if rf_auc >= mlp_auc:
+    best_model = rf_model
+    best_model_name = "RandomForest"
+else:
+    best_model = mlp_model
+    best_model_name = "MLP"
+
+print(f"Best Model: {best_model_name}")
+ 
+# 10. Evaluation: Confusion Matrix + ROC Curves
+
+from sklearn.metrics import ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
+
+# Predict again on validation
+y_val_preds = best_model.predict(X_val)
+y_val_probs = best_model.predict_proba(X_val)
+
+# Confusion Matrix
+plt.figure(figsize=(10, 8))
+ConfusionMatrixDisplay.from_predictions(y_val, y_val_preds, cmap=plt.cm.Blues)
+plt.title(f"Confusion Matrix ({best_model_name})")
+plt.show()
+
+# ROC Curves
+fpr = dict()
+tpr = dict()
+roc_auc = dict()
+
+for i in range(y_val_probs.shape[1]):
+    try:
+        fpr[i], tpr[i], _ = roc_curve((y_val == i).astype(int), y_val_probs[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+    except:
+        continue
+
+plt.figure(figsize=(12, 10))
+for i in range(y_val_probs.shape[1]):
+    if i in fpr:
+        plt.plot(fpr[i], tpr[i], label=f"Class {i} (AUC = {roc_auc[i]:.2f})")
+
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curves (Multi-class)")
+plt.legend(loc="lower right")
+plt.show()
+
+# 11. Save Model, Scaler, and Predictions
+
+import joblib
+
+# Save model
+joblib.dump(best_model, '/content/mineral_predictor_model.pth')
+
+# Save scaler
+joblib.dump(scaler, '/content/mineral_scaler.pkl')
+
+# Save geochem predictions
+geo_chem['predicted_mineral'] = best_model.predict(X_scaled)
+geo_chem_wgs84['predicted_mineral'] = geo_chem['predicted_mineral']
+geo_chem_wgs84['geometry'] = geo_chem['geometry'].to_crs(epsg=4326)
+
+geojson_outfile = "/content/geochem_with_predictions.geojson"
+geo_chem.to_file(geojson_outfile, driver='GeoJSON')
+
+print("Model, Scaler, and GeoJSON Predictions Saved.")
+
+# 12. 2D Folium Prediction Map
+
+import folium
+
+# Define color mapping for each mineral
+mineral_colors = {
+    0: 'red',        # Ce
+    1: 'orange',     # La
+    2: 'yellow',     # Nd
+    3: 'green',      # Cu
+    4: 'blue',       # Au
+    5: 'purple',     # U
+    6: 'pink',       # Th
+    7: 'brown',      # Pb
+    8: 'cyan',       # Zn
+    9: 'darkgreen',  # Ni
+    10: 'lightblue', # Co
+    11: 'violet',    # Li
+    12: 'darkred'    # Cr
+}
+
+# Define labels
+mineral_labels = {
+    0: 'Ce', 1: 'La', 2: 'Nd', 3: 'Cu', 4: 'Au', 5: 'U',
+    6: 'Th', 7: 'Pb', 8: 'Zn', 9: 'Ni', 10: 'Co', 11: 'Li', 12: 'Cr'
+}
+# Ensure folium map uses WGS84 (lat/lon)
+geo_chem_map = geo_chem.to_crs(epsg=4326)
+# Create folium map
+m = folium.Map(location=[geo_chem.geometry.y.mean(), geo_chem.geometry.x.mean()], zoom_start=7, tiles='cartodbpositron')
+
+for idx, row in geo_chem_wgs84.iterrows():
+    if row.geometry is None or row.geometry.x is None or row.geometry.y is None:
+        continue  # Skip invalid points
+
+    mineral_id = row['predicted_mineral']
+    color = mineral_colors.get(mineral_id, 'gray')
+    label = mineral_labels.get(mineral_id, 'Unknown')
+
+    folium.CircleMarker(
+        location=[row.geometry.y, row.geometry.x],
+        radius=4,
+        color=color,
+        fill=True,
+        fill_color=color,
+        fill_opacity=0.7,
+        popup=f"Predicted: {label}"
+    ).add_to(m)
+
+# Add Legend
+legend_html = '''
+<div style="position: fixed;
+bottom: 30px; left: 30px; width: 200px; height: 400px;
+background-color: white; z-index:9999; font-size:14px;
+overflow: auto; padding:10px;">
+<b>Mineral Legend</b><br>
+'''
+for k, v in mineral_labels.items():
+    legend_html += f'<i style="background:{mineral_colors[k]}; width:10px; height:10px; display:inline-block;"></i> {v}<br>'
+
+legend_html += '</div>'
+m.get_root().html.add_child(folium.Element(legend_html))
+
+# Save map
+m.save("/content/mineral_predictions_map.html")
+
+print("2D Prediction Map Saved!")
+ 
+# 14. Mineral Abundance Heatmaps
+ 
+# Create one heatmap per mineral
+for mineral_id, mineral_name in mineral_labels.items():
+    mineral_points = geo_chem[geo_chem['predicted_mineral'] == mineral_id]
+
+    if len(mineral_points) == 0:
+        continue  # Skip if no points
+
+    m_abundance = folium.Map(location=[geo_chem.geometry.y.mean(), geo_chem.geometry.x.mean()], zoom_start=7, tiles='cartodbpositron')
+
+    for idx, row in mineral_points.iterrows():
+        folium.CircleMarker(
+            location=[row.geometry.y, row.geometry.x],
+            radius=3,
+            color=mineral_colors[mineral_id],
+            fill=True,
+            fill_color=mineral_colors[mineral_id],
+            fill_opacity=0.6,
+            popup=f"{mineral_name}"
+        ).add_to(m_abundance)
+
+    file_name = f"/content/{mineral_name}_abundance_map.html"
+    m_abundance.save(file_name)
+
+print("Abundance Heatmaps Saved for all predicted minerals!")
+ 
+# 15. Download Saved Outputs
+ 
+from google.colab import files
+
+# Download important outputs manually
+files.download("/content/mineral_predictor_model.pth")
+files.download("/content/mineral_scaler.pkl")
+files.download("/content/geochem_with_predictions.geojson")
+files.download("/content/mineral_predictions_map.html")
+files.download("/content/Ce_abundance_map.html")
+#Upload Lineaments File for 3D Map
+import zipfile
+import os
+from google.colab import files
+import geopandas as gpd
+
+# Upload and extract
+uploaded = files.upload()
+
+for fname in uploaded.keys():
+    if fname.endswith('.zip'):
+        with zipfile.ZipFile(fname, 'r') as zip_ref:
+            zip_ref.extractall("/content/data")
+            print(f"Extracted {fname}")
+
+# Search for lineament shapefile
+DATA_DIR = "/content/data"
+shapefiles = [os.path.join(root, file) for root, dirs, files in os.walk(DATA_DIR) for file in files if file.endswith(".shp")]
+lineament_file = [s for s in shapefiles if "lineament" in s.lower()][0]
+
+# Load and reproject
+lineament_overlay = gpd.read_file(lineament_file)
+lineament_overlay = lineament_overlay.to_crs("EPSG:4326")
+# Enhanced 3D Visualization with DEM + Lineaments
+import numpy as np
+import plotly.graph_objs as go
+import rasterio
+from pyproj import Transformer
+
+# Load DEM raster
+with rasterio.open(aeromag_raster) as dem_src:
+    dem = dem_src.read(1)
+    transform = dem_src.transform
+    crs_from = dem_src.crs
+    crs_to = "EPSG:4326"
+
+# Downsample for performance
+step = 20
+z = dem[::step, ::step]
+rows, cols = z.shape
+
+# Create grid of UTM coordinates
+x_coords = np.arange(cols) * transform.a + transform.c
+y_coords = np.arange(rows) * transform.e + transform.f
+xv, yv = np.meshgrid(x_coords, y_coords)
+
+# Reproject grid to lat/lon
+transformer = Transformer.from_crs(crs_from, crs_to, always_xy=True)
+lonv, latv = transformer.transform(xv, yv)
+
+# Mask no-data values
+z = np.where((z > -1e5) & (z < 1e5), z, np.nan)
+
+# Terrain surface
+terrain_surface = go.Surface(
+    x=lonv, y=latv, z=z + 100,  # Elevated above minerals
+    colorscale='Greens',
+    opacity=0.6,
+    showscale=False,
+    contours=dict(
+        z=dict(show=True, usecolormap=True, highlightcolor="limegreen", project_z=True)
+    ),
+    name='Topography'
+)
+
+# Keep original WGS84 for plotting
+geo_chem_wgs84 = geo_chem.to_crs(epsg=4326)
+
+# Projected version for raster sampling
+geo_chem_proj = geo_chem.to_crs(aero_data.crs)
+
+# Sample raster values
+geo_chem['magnetic_value'] = sample_raster(aero_data, geo_chem_proj)
+geo_chem['gravity_value'] = sample_raster(grav_data, geo_chem_proj)
+
+# Mineral scatter
+# Flattened 3D mineral layer (colored by mineral class, stratified by depth)
+mineral_colors = geo_chem_wgs84['predicted_mineral']
+depth_levels = sorted(mineral_colors.unique())
+depth_bins = np.linspace(0, 1000, len(depth_levels))
+depth_map = dict(zip(depth_levels, depth_bins))
+
+mineral_z = geo_chem_wgs84['predicted_mineral'].map(depth_map)
+mineral_hover = geo_chem_wgs84['predicted_mineral'].map(mineral_labels)
+
+mineral_scatter = go.Scatter3d(
+    x=geo_chem_wgs84.geometry.x,
+    y=geo_chem_wgs84.geometry.y,
+    z=-mineral_z,
+    mode='markers',
+    marker=dict(
+        size=3,
+        color=geo_chem_wgs84['predicted_mineral'],
+        colorscale='Rainbow',
+        colorbar=dict(
+            title="Mineral Class",
+            tickvals=list(mineral_labels.keys()),
+            ticktext=[f"{k}: {v}" for k, v in mineral_labels.items()],
+            len=0.8,
+            thickness=20
+        ),
+        opacity=0.8
+    ),
+    text=mineral_hover,
+    name='Minerals'
+)
+
+# Lineament overlay (z = 0)
+lineament_lines = []
+for _, row in lineament_overlay.iterrows():
+    coords = list(row.geometry.coords)
+    xs, ys = zip(*coords)
+    transformer = Transformer.from_crs(lineament_overlay.crs, "EPSG:4326", always_xy=True)
+    lons, lats = transformer.transform(xs, ys)
+    lineament_lines.append(
+        go.Scatter3d(
+            x=lons, y=lats, z=[0]*len(lons),
+            mode='lines',
+            line=dict(color='black', width=2),
+            name='Lineament',
+            showlegend=True if len(lineament_lines) == 0 else False
+        )
+    )
+
+# Combine all layers
+fig = go.Figure(data=[terrain_surface, mineral_scatter] + lineament_lines)
+fig.update_layout(
+    scene=dict(
+        xaxis_title='Longitude',
+        yaxis_title='Latitude',
+        zaxis_title='Elevation / Depth (m, depth = 0 to -1000)',
+        zaxis=dict(autorange='reversed')
+    ),
+    title='3D Mineral Prediction with Terrain and Lineaments'
+)
+
+fig.write_html("enhanced_3d_map.html")
+
+from google.colab import files
+files.download("enhanced_3d_map.html")
+ 
+# 16. F1-Score and Feature Importance
+from sklearn.metrics import f1_score, classification_report
+
+# F1-score (Macro)
+f1_macro = f1_score(y_val, y_val_preds, average='macro')
+print(f"\nMacro F1-Score ({best_model_name}): {f1_macro:.4f}")
+
+# Adjust labels and target_names to actual classes present in y_val
+unique_labels = sorted(np.unique(y_val))
+target_names = [mineral_labels[i] for i in unique_labels]
+
+# Full classification report
+print("\nClassification Report:")
+print(classification_report(y_val, y_val_preds, labels=unique_labels, target_names=target_names))
+#Feature Importance
+importances = rf_model.feature_importances_
+importance_df = pd.DataFrame({
+    'Feature': feature_columns,
+    'Importance': importances
+}).sort_values(by='Importance', ascending=False)
+
+# Plot
+import matplotlib.pyplot as plt
+plt.figure(figsize=(12, 6))
+plt.barh(importance_df['Feature'].head(10), importance_df['Importance'].head(10), color='teal')
+plt.xlabel("Importance")
+plt.title("Top 10 Feature Importances (Random Forest)")
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.show()
